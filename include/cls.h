@@ -29,6 +29,6 @@
 #define __CLS_H__
 
 void clsInit(void);
-void clsTimeZone(void);
+void clsSetLogLevel(int level);
 
 #endif
