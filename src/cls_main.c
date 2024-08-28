@@ -44,6 +44,8 @@
 #include "cls_sds.h"
 #include "cls_adlist.h"
 #include "cls_rax.h"
+#include "cls_dict.h"
+#include "cls_util.h"
 #include "cls.h"
 
 /* Error codes */
@@ -204,8 +206,8 @@ typedef struct clusterState {
     uint64_t currentEpoch;
     int state;              /* CLUSTER_OK, CLUSTER_FAIL, ... */
     int size;               /* Num of master nodes with at least one slot */
-    list *nodes;            /* Hash table of name -> clusterNode structures */
-    list *nodes_black_list; /* Nodes we don't re-add for a few seconds. */
+    dict *nodes;            /* Hash table of name -> clusterNode structures */
+    dict *nodes_black_list; /* Nodes we don't re-add for a few seconds. */
     clusterNode *migrating_slots_to[CLUSTER_SLOTS];
     clusterNode *importing_slots_from[CLUSTER_SLOTS];
     clusterNode *slots[CLUSTER_SLOTS];
@@ -619,8 +621,68 @@ static int clsLockConfig(char *filename) {
     return C_OK;
 }
 
+uint64_t dictSdsHash(const void *key) {
+    return dictGenHashFunction((unsigned char*)key, sdslen((char*)key));
+}
+
+uint64_t dictSdsCaseHash(const void *key) {
+    return dictGenCaseHashFunction((unsigned char*)key, sdslen((char*)key));
+}
+
+int dictSdsKeyCompare(void *privdata, const void *key1, const void *key2) {
+    int l1,l2;
+    DICT_NOTUSED(privdata);
+
+    l1 = sdslen((sds)key1);
+    l2 = sdslen((sds)key2);
+    if (l1 != l2) return 0;
+    return memcmp(key1, key2, l1) == 0;
+}
+
+/* A case insensitive version used for the command lookup table and other
+ * places where case insensitive non binary-safe comparison is needed. */
+int dictSdsKeyCaseCompare(void *privdata, const void *key1, const void *key2) {
+    DICT_NOTUSED(privdata);
+    return strcasecmp(key1, key2) == 0;
+}
+
+void dictSdsDestructor(void *privdata, void *val) {
+    DICT_NOTUSED(privdata);
+    sdsfree(val);
+}
+
+/* Cluster nodes hash table, mapping nodes addresses 1.2.3.4:6379 to
+ * clusterNode structures. */
+dictType clusterNodesDictType = {
+    dictSdsHash,                /* hash function */
+    NULL,                       /* key dup */
+    NULL,                       /* val dup */
+    dictSdsKeyCompare,          /* key compare */
+    dictSdsDestructor,          /* key destructor */
+    NULL                        /* val destructor */
+};
+
+/* Cluster re-addition blacklist. This maps node IDs to the time
+ * we can re-add this node. The goal is to avoid readding a removed
+ * node for some time. */
+dictType clusterNodesBlackListDictType = {
+    dictSdsCaseHash,            /* hash function */
+    NULL,                       /* key dup */
+    NULL,                       /* val dup */
+    dictSdsKeyCaseCompare,      /* key compare */
+    dictSdsDestructor,          /* key destructor */
+    NULL                        /* val destructor */
+};
+
 /* Node lookup by name */
 static clusterNode *clsLookupNode(const char *name) {
+    sds s = sdsnewlen(name, CLUSTER_NAMELEN);
+    dictEntry *de;
+
+    de = dictFind(gcls->nodes, s);
+    sdsfree(s);
+    if (de == NULL) return NULL;
+    return dictGetVal(de);
 }
 
 /* ---------------------- API exported outside -------------------- */
@@ -633,8 +695,8 @@ void clsInit(void) {
     gcls->state = CLUSTER_FAIL;
     gcls->size = 1;
     gcls->todo_before_sleep = 0;
-    gcls->nodes = listCreate();
-    gcls->nodes_black_list = listCreate();
+    gcls->nodes = dictCreate(&clusterNodesDictType, NULL);
+    gcls->nodes_black_list = dictCreate(&clusterNodesBlackListDictType, NULL);
     gcls->failover_auth_time = 0;
     gcls->failover_auth_count = 0;
     gcls->failover_auth_rank = 0;
