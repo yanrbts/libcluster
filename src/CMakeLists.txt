@@ -1,5 +1,18 @@
 # 查找所有的源文件
-file(GLOB_RECURSE SOURCE_FILES "*.c")
+# file(GLOB_RECURSE SOURCE_FILES "*.c")
+
+set(SOURCE_FILES
+    ae.c
+    anet.c
+    cls_adlist.c
+    cls_dict.c
+    cls_main.c
+    cls_malloc.c
+    cls_rax.c
+    cls_sds.c 
+    cls_util.c
+    sha1.c
+)
 
 # 生成共享库 libalgorithm.so
 add_library(cls_shared SHARED ${SOURCE_FILES})

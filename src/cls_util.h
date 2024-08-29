@@ -29,5 +29,6 @@
 #define __UTIL_H__
 
 void getRandomHexChars(char *p, size_t len);
+long long mstime(void);
 
 #endif

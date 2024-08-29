@@ -100,3 +100,19 @@ void getRandomHexChars(char *p, size_t len) {
     getRandomBytes((unsigned char*)p,len);
     for (j = 0; j < len; j++) p[j] = charset[p[j] & 0x0F];
 }
+
+/* This function returns the current time in microseconds. */
+static long long ustime(void) {
+    struct timeval tv;
+    long long ust;
+
+    gettimeofday(&tv, NULL);
+    ust = ((long long)tv.tv_sec)*1000000;
+    ust += tv.tv_usec;
+    return ust;
+}
+
+/* This function returns the current time in milliseconds. */
+long long mstime(void) {
+    return ustime()/1000;
+}
