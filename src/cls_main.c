@@ -406,7 +406,10 @@ static uint64_t clusterGetMaxEpoch(void);
 
 static clusterLink *createClusterLink(clusterNode *node);
 static void freeClusterLink(clusterLink *link);
+static void handleLinkIOError(clusterLink *link);
 static void clusterAcceptHandler(aeEventLoop *el, int fd, void *privdata, int mask);
+static void clusterReadHandler(aeEventLoop *el, int fd, void *privdata, int mask);
+static int clusterProcessPacket(clusterLink *link);
 
 static clusterNode *createClusterNode(char *nodename, int flags);
 static int clusterNodeAddFailureReport(clusterNode *failing, clusterNode *sender);
@@ -1054,6 +1057,16 @@ static void freeClusterLink(clusterLink *link) {
     zfree(link);
 }
 
+/* This function is called when we detect the link with this node is lost.
+   We set the node as no longer connected. The Cluster Cron will detect
+   this connection and will try to get it connected again.
+
+   Instead if the node is a temporary node used to accept a query, we
+   completely free the node on error. */
+static void handleLinkIOError(clusterLink *link) {
+    freeClusterLink(link);
+}
+
 #define MAX_CLUSTER_ACCEPTS_PER_CALL 1000
 static void clusterAcceptHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
     int cport, cfd;
@@ -1086,6 +1099,84 @@ static void clusterAcceptHandler(aeEventLoop *el, int fd, void *privdata, int ma
         link->fd = cfd;
         aeCreateFileEvent(server.el, cfd, AE_READABLE, clusterReadHandler, link);
     }
+}
+
+/* Read data. Try to read the first field of the header first to check the
+ * full length of the packet. When a whole packet is in memory this function
+ * will call the function to process the packet. And so forth. */
+static void clusterReadHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
+    char buf[sizeof(clusterMsg)];
+    ssize_t nread;
+    clusterMsg *hdr;
+    clusterLink *link = (clusterLink*)privdata;
+    unsigned int readlen, rcvbuflen;
+    UNUSED(el);
+    UNUSED(mask);
+
+    while (1) {
+        /* Read as long as there is data to read. */
+        rcvbuflen = sdslen(link->rcvbuf);
+        if (rcvbuflen < 8) {
+            /* First, obtain the first 8 bytes to get the full message
+             * length. */
+            readlen = 8 - rcvbuflen;
+        } else {
+            /* Finally read the full message. */
+            hdr = (clusterMsg*)link->rcvbuf;
+            if (rcvbuflen == 8) {
+                /* Perform some sanity check on the message signature
+                 * and length. */
+                if (memcmp(hdr->sig,"RCmb",4) != 0 ||
+                    ntohl(hdr->totlen) < CLUSTERMSG_MIN_LEN) {
+                    clsLog(LOG_WARNING,
+                        "Bad message length or signature received "
+                        "from Cluster bus.");
+                    handleLinkIOError(link);
+                    return;
+                }
+            }
+            readlen = ntohl(hdr->totlen) - rcvbuflen;
+            if (readlen > sizeof(buf)) readlen = sizeof(buf);
+        }
+
+        nread = read(fd, buf, readlen);
+        if (nread == -1 && errno == EAGAIN) return; /* No more data ready. */
+
+        if (nread <= 0) {
+            /* I/O error... */
+            clsLog(LOG_DEBUG,"I/O error reading from node link: %s",
+                (nread == 0) ? "connection closed" : strerror(errno));
+            handleLinkIOError(link);
+            return;
+        } else {
+            /* Read data and recast the pointer to the new buffer. */
+            link->rcvbuf = sdscatlen(link->rcvbuf, buf, nread);
+            hdr = (clusterMsg*)link->rcvbuf;
+            rcvbuflen += nread;
+        }
+
+        /* Total length obtained? Process this packet. */
+        if (rcvbuflen >= 8 && rcvbuflen == ntohl(hdr->totlen)) {
+            if (clusterProcessPacket(link)) {
+                sdsfree(link->rcvbuf);
+                link->rcvbuf = sdsempty();
+            } else {
+                return; /* Link no longer valid. */
+            }
+        }
+    }
+}
+
+/* When this function is called, there is a packet to process starting
+ * at node->rcvbuf. Releasing the buffer is up to the caller, so this
+ * function should just handle the higher level stuff of processing the
+ * packet, modifying the cluster state if needed.
+ *
+ * The function returns 1 if the link is still valid after the packet
+ * was processed, otherwise 0 if the link was freed since the packet
+ * processing lead to some inconsistency error (for instance a PONG
+ * received from the wrong sender ID). */
+static int clusterProcessPacket(clusterLink *link) {
 }
 
 /* -----------------------------------------------------------------------------
