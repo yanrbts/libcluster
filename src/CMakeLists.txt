@@ -11,6 +11,7 @@ set(SOURCE_FILES
     cls_rax.c
     cls_sds.c 
     cls_util.c
+    endianconv.c
     sha1.c
 )
 
