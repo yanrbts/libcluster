@@ -371,6 +371,10 @@ struct Server {
     char *cluster_announce_ip;  /* IP address to announce on cluster bus. */
     int cluster_announce_port;     /* base port to announce on cluster bus. */
     int cluster_announce_bus_port; /* bus port to announce on cluster bus. */
+    int cluster_module_flags;      /* Set of flags that Redis modules are able
+                                      to set in order to suppress certain
+                                      native Redis Cluster features. Check the
+                                      REDISMODULE_CLUSTER_FLAG_*. */
 
     long long master_repl_offset;   /* My current replication offset */
 } server;
@@ -447,6 +451,7 @@ static int clusterNodeAddSlave(clusterNode *master, clusterNode *slave);
 static int clusterCountNonFailingSlaves(clusterNode *n);
 static int clusterAddNode(clusterNode *node);
 static void clusterDelNode(clusterNode *delnode);
+static void clusterRenameNode(clusterNode *node, char *newname);
 static clusterNode *clusterLookupNode(const char *name);
 
 static sds representClusterNodeFlags(sds ci, uint16_t flags);
@@ -464,6 +469,7 @@ static int nodeUpdateAddressIfNeeded(clusterNode *node, clusterLink *link,
 static void clusterSetNodeAsMaster(clusterNode *n);
 static void clusterUpdateSlotsConfigWith(clusterNode *sender, 
                             uint64_t senderConfigEpoch, unsigned char *slots);
+static void clusterSetMaster(clusterNode *n);
 
 static void clusterBlacklistCleanup(void);
 static void clusterBlacklistAddNode(clusterNode *node);
@@ -473,6 +479,8 @@ static void clusterUpdateState(void);
 static void resetManualFailover(void);
 static void manualFailoverCheckTimeout(void);
 static void clusterHandleManualFailover(void);
+static unsigned int countKeysInSlot(unsigned int hashslot);
+static unsigned int delKeysInSlot(unsigned int hashslot);
 
 /*============================ Utility functions ============================ */
 
@@ -2090,7 +2098,7 @@ static int clusterProcessPacket(clusterLink *link) {
                 /* If we already have this node, try to change the
                  * IP/port of the node with the new one. */
                 if (sender) {
-                    serverLog(LOG_DEBUG,
+                    clsLog(LOG_DEBUG,
                         "Handshake: we already know node %.40s, "
                         "updating the address if needed.", sender->name);
                     if (nodeUpdateAddressIfNeeded(sender,link,hdr)) {
@@ -3355,6 +3363,130 @@ static void clusterUpdateSlotsConfigWith(clusterNode *sender, uint64_t senderCon
         clsLog(LOG_WARNING,"Discarding UPDATE message about myself.");
         return;
     }
+
+    for (j = 0; j < CLUSTER_SLOTS; j++) {
+        if (bitmapTestBit(slots, j)) {
+            /* The slot is already bound to the sender of this message. */
+            if (server.cluster->slots[j] == sender) continue;
+
+            /* The slot is in importing state, it should be modified only
+             * manually via redis-trib (example: a resharding is in progress
+             * and the migrating side slot was already closed and is advertising
+             * a new config. We still want the slot to be closed manually). */
+            if (server.cluster->importing_slots_from[j]) continue;
+
+            /* We rebind the slot to the new node claiming it if:
+             * 1) The slot was unassigned or the new node claims it with a
+             *    greater configEpoch.
+             * 2) We are not currently importing the slot. */
+            if (server.cluster->slots[j] == NULL ||
+                server.cluster->slots[j]->configEpoch < senderConfigEpoch)
+            {
+                /* Was this slot mine, and still contains keys? Mark it as
+                 * a dirty slot. */
+                if (server.cluster->slots[j] == myself &&
+                    countKeysInSlot(j) &&
+                    sender != myself)
+                {
+                    dirty_slots[dirty_slots_count] = j;
+                    dirty_slots_count++;
+                }
+
+                if (server.cluster->slots[j] == curmaster)
+                    newmaster = sender;
+                clusterDelSlot(j);
+                clusterAddSlot(sender, j);
+                clusterDoBeforeSleep(CLUSTER_TODO_SAVE_CONFIG|
+                                     CLUSTER_TODO_UPDATE_STATE|
+                                     CLUSTER_TODO_FSYNC_CONFIG);
+            }
+        }
+    }
+
+    /* After updating the slots configuration, don't do any actual change
+     * in the state of the server if a module disabled Redis Cluster
+     * keys redirections. */
+    if (server.cluster_module_flags & CLUSTER_MODULE_FLAG_NO_REDIRECTION)
+        return;
+    
+    /* If at least one slot was reassigned from a node to another node
+     * with a greater configEpoch, it is possible that:
+     * 1) We are a master left without slots. This means that we were
+     *    failed over and we should turn into a replica of the new
+     *    master.
+     * 2) We are a slave and our master is left without slots. We need
+     *    to replicate to the new slots owner. */
+    if (newmaster && curmaster->numslots == 0) {
+        clsLog(LOG_WARNING,
+            "Configuration change detected. Reconfiguring myself "
+            "as a replica of %.40s", sender->name);
+        clusterSetMaster(sender);
+        clusterDoBeforeSleep(CLUSTER_TODO_SAVE_CONFIG|
+                             CLUSTER_TODO_UPDATE_STATE|
+                             CLUSTER_TODO_FSYNC_CONFIG);
+    } else if (dirty_slots_count) {
+        /* If we are here, we received an update message which removed
+         * ownership for certain slots we still have keys about, but still
+         * we are serving some slots, so this master node was not demoted to
+         * a slave.
+         *
+         * In order to maintain a consistent state between keys and slots
+         * we need to remove all the keys from the slots we lost. */
+        for (j = 0; j < dirty_slots_count; j++)
+            delKeysInSlot(dirty_slots[j]);
+    }
+}
+
+/* -----------------------------------------------------------------------------
+ * SLOTS functions
+ * -------------------------------------------------------------------------- */
+
+static unsigned int countKeysInSlot(unsigned int hashslot) {
+    return server.cluster->slots_keys_count[hashslot];
+}
+
+/* Remove all the keys in the specified hash slot.
+ * The number of removed items is returned. */
+static unsigned int delKeysInSlot(unsigned int hashslot) {
+    raxIterator iter;
+    int j = 0;
+    unsigned char indexed[2];
+
+    indexed[0] = (hashslot >> 8) & 0xff;
+    indexed[1] = hashslot & 0xff;
+    raxStart(&iter, server.cluster->slots_to_keys);
+    while (server.cluster->slots_keys_count[hashslot]) {
+        raxSeek(&iter, ">=", indexed, 2);
+        raxNext(&iter);
+
+        j++;
+    }
+    raxStop(&iter);
+    return j;
+}
+
+/* -----------------------------------------------------------------------------
+ * SLAVE nodes handling
+ * -------------------------------------------------------------------------- */
+
+/* Set the specified node 'n' as master for this node.
+ * If this node is currently a master, it is turned into a slave. */
+static void clusterSetMaster(clusterNode *n) {
+    assert(n != myself);
+    assert(myself->numslots == 0);
+
+    if (nodeIsMaster(myself)) {
+        myself->flags &= ~(CLUSTER_NODE_MASTER|CLUSTER_NODE_MIGRATE_TO);
+        myself->flags |= CLUSTER_NODE_SLAVE;
+        clusterCloseAllSlots();
+    } else {
+        if (myself->slaveof)
+            clusterNodeRemoveSlave(myself->slaveof,myself);
+    }
+    myself->slaveof = n;
+    clusterNodeAddSlave(n,myself);
+    // replicationSetMaster(n->ip, n->port);
+    resetManualFailover();
 }
 
 
