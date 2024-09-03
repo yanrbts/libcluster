@@ -70,6 +70,8 @@
 #define CONFIG_BINDADDR_MAX 16
 #define NET_IP_STR_LEN 46 /* INET6_ADDRSTRLEN is 46, but we need to be sure */
 #define LOG_MAX_LEN 1024
+/* Get the first bind addr or NULL */
+#define NET_FIRST_BIND_ADDR (server.bindaddr_count ? server.bindaddr[0] : NULL)
 
 #define CLUSTER_SLOTS 16384
 #define CLUSTER_OK 0          /* Everything looks ok */
@@ -3812,6 +3814,226 @@ void clusterCron(void) {
      * better decisions in other part of the code. */
     di = dictGetSafeIterator(server.cluster->nodes);
     server.cluster->stats_pfail_nodes = 0;
+    while ((de = dictNext(di)) != NULL) {
+        clusterNode *node = dictGetVal(de);
+
+        /* Not interested in reconnecting the link with myself or nodes
+         * for which we have no address. */
+        if (node->flags & (CLUSTER_NODE_MYSELF|CLUSTER_NODE_NOADDR)) continue;
+
+        if (node->flags & CLUSTER_NODE_PFAIL)
+            server.cluster->stats_pfail_nodes++;
+
+        /* A Node in HANDSHAKE state has a limited lifespan equal to the
+         * configured node timeout. */
+        if (nodeInHandshake(node) && now-node->ctime > handshake_timeout) {
+            clusterDelNode(node);
+            continue;
+        }
+
+        if (node->link == NULL) {
+            int fd;
+            mstime_t old_ping_sent;
+            clusterLink *link;
+
+            fd = anetTcpNonBlockBindConnect(server.neterr, node->ip,
+                node->cport, NET_FIRST_BIND_ADDR);
+            if (fd == -1) {
+                /* We got a synchronous error from connect before
+                 * clusterSendPing() had a chance to be called.
+                 * If node->ping_sent is zero, failure detection can't work,
+                 * so we claim we actually sent a ping now (that will
+                 * be really sent as soon as the link is obtained). */
+                if (node->ping_sent == 0) node->ping_sent = mstime();
+                clsLog(LOG_DEBUG, "Unable to connect to "
+                    "Cluster Node [%s]:%d -> %s", node->ip,
+                    node->cport, server.neterr);
+                continue;
+            }
+            link = createClusterLink(node);
+            link->fd = fd;
+            node->link = link;
+            aeCreateFileEvent(server.el, link->fd, AE_READABLE,
+                    clusterReadHandler, link);
+            /* Queue a PING in the new connection ASAP: this is crucial
+             * to avoid false positives in failure detection.
+             *
+             * If the node is flagged as MEET, we send a MEET message instead
+             * of a PING one, to force the receiver to add us in its node
+             * table. */
+            old_ping_sent = node->ping_sent;
+            clusterSendPing(link, node->flags & CLUSTER_NODE_MEET ?
+                    CLUSTERMSG_TYPE_MEET : CLUSTERMSG_TYPE_PING);
+            if (old_ping_sent) {
+                /* If there was an active ping before the link was
+                 * disconnected, we want to restore the ping time, otherwise
+                 * replaced by the clusterSendPing() call. */
+                node->ping_sent = old_ping_sent;
+            }
+            /* We can clear the flag after the first packet is sent.
+             * If we'll never receive a PONG, we'll never send new packets
+             * to this node. Instead after the PONG is received and we
+             * are no longer in meet/handshake status, we want to send
+             * normal PING packets. */
+            node->flags &= ~CLUSTER_NODE_MEET;
+
+            clsLog(LOG_DEBUG,"Connecting with Node %.40s at %s:%d",
+                    node->name, node->ip, node->cport);
+        }
+    }
+    dictReleaseIterator(di);
+
+    /* Ping some random node 1 time every 10 iterations, so that we usually ping
+     * one random node every second. */
+    if (!(iteration % 10)) {
+        int j;
+
+        /* Check a few random nodes and ping the one with the oldest
+         * pong_received time. */
+        for (j = 0; j < 5; j++) {
+            de = dictGetRandomKey(server.cluster->nodes);
+            clusterNode *this = dictGetVal(de);
+
+            /* Don't ping nodes disconnected or with a ping currently active. */
+            if (this->link == NULL || this->ping_sent != 0) continue;
+            if (this->flags & (CLUSTER_NODE_MYSELF|CLUSTER_NODE_HANDSHAKE))
+                continue;
+            if (min_pong_node == NULL || min_pong > this->pong_received) {
+                min_pong_node = this;
+                min_pong = this->pong_received;
+            }
+        }
+        if (min_pong_node) {
+            clsLog(LOG_DEBUG,"Pinging node %.40s", min_pong_node->name);
+            clusterSendPing(min_pong_node->link, CLUSTERMSG_TYPE_PING);
+        }
+    }
+
+    /* Iterate nodes to check if we need to flag something as failing.
+     * This loop is also responsible to:
+     * 1) Check if there are orphaned masters (masters without non failing
+     *    slaves).
+     * 2) Count the max number of non failing slaves for a single master.
+     * 3) Count the number of slaves for our master, if we are a slave. */
+    orphaned_masters = 0;
+    max_slaves = 0;
+    this_slaves = 0;
+    di = dictGetSafeIterator(server.cluster->nodes);
+    while ((de = dictNext(di)) != NULL) {
+        clusterNode *node = dictGetVal(de);
+        now = mstime(); /* Use an updated time at every iteration. */
+        mstime_t delay;
+
+        if (node->flags &
+            (CLUSTER_NODE_MYSELF|CLUSTER_NODE_NOADDR|CLUSTER_NODE_HANDSHAKE))
+                continue;
+        
+        /* Orphaned master check, useful only if the current instance
+         * is a slave that may migrate to another master. */
+        if (nodeIsSlave(myself) && nodeIsMaster(node) && !nodeFailed(node)) {
+            int okslaves = clusterCountNonFailingSlaves(node);
+
+            /* A master is orphaned if it is serving a non-zero number of
+             * slots, have no working slaves, but used to have at least one
+             * slave, or failed over a master that used to have slaves. */
+            if (okslaves == 0 && node->numslots > 0 &&
+                node->flags & CLUSTER_NODE_MIGRATE_TO)
+            {
+                orphaned_masters++;
+            }
+            if (okslaves > max_slaves) max_slaves = okslaves;
+            if (nodeIsSlave(myself) && myself->slaveof == node)
+                this_slaves = okslaves;
+        }
+
+        /* If we are waiting for the PONG more than half the cluster
+         * timeout, reconnect the link: maybe there is a connection
+         * issue even if the node is alive. */
+        if (node->link && /* is connected */
+            now - node->link->ctime >
+            server.cluster_node_timeout && /* was not already reconnected */
+            node->ping_sent && /* we already sent a ping */
+            node->pong_received < node->ping_sent && /* still waiting pong */
+            /* and we are waiting for the pong more than timeout/2 */
+            now - node->ping_sent > server.cluster_node_timeout/2)
+        {
+            /* Disconnect the link, it will be reconnected automatically. */
+            freeClusterLink(node->link);
+        }
+
+        /* If we have currently no active ping in this instance, and the
+         * received PONG is older than half the cluster timeout, send
+         * a new ping now, to ensure all the nodes are pinged without
+         * a too big delay. */
+        if (node->link &&
+            node->ping_sent == 0 &&
+            (now-node->pong_received) > server.cluster_node_timeout/2)
+        {
+            clusterSendPing(node->link, CLUSTERMSG_TYPE_PING);
+            continue;
+        }
+
+        /* If we are a master and one of the slaves requested a manual
+         * failover, ping it continuously. */
+        if (server.cluster->mf_end &&
+            nodeIsMaster(myself) &&
+            server.cluster->mf_slave == node &&
+            node->link)
+        {
+            clusterSendPing(node->link, CLUSTERMSG_TYPE_PING);
+            continue;
+        }
+
+        /* Check only if we have an active ping for this instance. */
+        if (node->ping_sent == 0) continue;
+
+        /* Compute the delay of the PONG. Note that if we already received
+         * the PONG, then node->ping_sent is zero, so can't reach this
+         * code at all. */
+        delay = now - node->ping_sent;
+
+        if (delay > server.cluster_node_timeout) {
+            /* Timeout reached. Set the node as possibly failing if it is
+             * not already in this state. */
+            if (!(node->flags & (CLUSTER_NODE_PFAIL|CLUSTER_NODE_FAIL))) {
+                clsLog(LOG_DEBUG,"*** NODE %.40s possibly failing",
+                    node->name);
+                node->flags |= CLUSTER_NODE_PFAIL;
+                update_state = 1;
+            }
+        }
+    }
+    dictReleaseIterator(di);
+
+    /* If we are a slave node but the replication is still turned off,
+     * enable it if we know the address of our master and it appears to
+     * be up. */
+    /*if (nodeIsSlave(myself) &&
+        server.masterhost == NULL &&
+        myself->slaveof &&
+        nodeHasAddr(myself->slaveof))
+    {
+        replicationSetMaster(myself->slaveof->ip, myself->slaveof->port);
+    }*/
+
+    /* Abourt a manual failover if the timeout is reached. */
+    manualFailoverCheckTimeout();
+
+    if (nodeIsSlave(myself)) {
+        clusterHandleManualFailover();
+        if (!(server.cluster_module_flags & CLUSTER_MODULE_FLAG_NO_FAILOVER))
+            clusterHandleSlaveFailover();
+        /* If there are orphaned slaves, and we are a slave among the masters
+         * with the max number of non-failing slaves, consider migrating to
+         * the orphaned masters. Note that it does not make sense to try
+         * a migration if there is no master with at least *two* working
+         * slaves. */
+        if (orphaned_masters && max_slaves >= 2 && this_slaves == max_slaves)
+            clusterHandleSlaveMigration(max_slaves);
+    }
+
+    if (update_state || server.cluster->state == CLUSTER_FAIL)
+        clusterUpdateState();
 }
 
 
