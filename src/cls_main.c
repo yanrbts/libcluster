@@ -412,7 +412,10 @@ static int clusterLoadConfig(char *filename);
 static int clusterSaveConfig(int do_fsync);
 static void clusterSaveConfigOrDie(int do_fsync);
 static int clusterLockConfig(char *filename);
+static void clusterUpdateMyselfFlags(void);
 static uint64_t clusterGetMaxEpoch(void);
+static int clusterBumpConfigEpochWithoutConsensus(void);
+static void clusterHandleConfigEpochCollision(clusterNode *sender);
 
 static clusterLink *createClusterLink(clusterNode *node);
 static void freeClusterLink(clusterLink *link);
@@ -1062,6 +1065,22 @@ static int clusterLockConfig(char *filename) {
     return C_OK;
 }
 
+/* Some flags (currently just the NOFAILOVER flag) may need to be updated
+ * in the "myself" node based on the current configuration of the node,
+ * that may change at runtime via CONFIG SET. This function changes the
+ * set of flags in myself->flags accordingly. */
+static void clusterUpdateMyselfFlags(void) {
+    int oldflags = myself->flags;
+    int nofailover = server.cluster_slave_no_failover ?
+                     CLUSTER_NODE_NOFAILOVER : 0;
+    myself->flags &= ~CLUSTER_NODE_NOFAILOVER;
+    myself->flags |= nofailover;
+    if (myself->flags != oldflags) {
+        clusterDoBeforeSleep(CLUSTER_TODO_SAVE_CONFIG|
+                             CLUSTER_TODO_UPDATE_STATE);
+    }
+}
+
 /* -----------------------------------------------------------------------------
  * CLUSTER config epoch handling
  * -------------------------------------------------------------------------- */
@@ -1081,6 +1100,117 @@ static uint64_t clusterGetMaxEpoch(void) {
     dictReleaseIterator(di);
     if (max < server.cluster->currentEpoch) max = server.cluster->currentEpoch;
     return max;
+}
+
+/* If this node epoch is zero or is not already the greatest across the
+ * cluster (from the POV of the local configuration), this function will:
+ *
+ * 1) Generate a new config epoch, incrementing the current epoch.
+ * 2) Assign the new epoch to this node, WITHOUT any consensus.
+ * 3) Persist the configuration on disk before sending packets with the
+ *    new configuration.
+ *
+ * If the new config epoch is generated and assigend, C_OK is returned,
+ * otherwise C_ERR is returned (since the node has already the greatest
+ * configuration around) and no operation is performed.
+ *
+ * Important note: this function violates the principle that config epochs
+ * should be generated with consensus and should be unique across the cluster.
+ * However Redis Cluster uses this auto-generated new config epochs in two
+ * cases:
+ *
+ * 1) When slots are closed after importing. Otherwise resharding would be
+ *    too expensive.
+ * 2) When CLUSTER FAILOVER is called with options that force a slave to
+ *    failover its master even if there is not master majority able to
+ *    create a new configuration epoch.
+ *
+ * Redis Cluster will not explode using this function, even in the case of
+ * a collision between this node and another node, generating the same
+ * configuration epoch unilaterally, because the config epoch conflict
+ * resolution algorithm will eventually move colliding nodes to different
+ * config epochs. However using this function may violate the "last failover
+ * wins" rule, so should only be used with care. */
+static int clusterBumpConfigEpochWithoutConsensus(void) {
+    uint64_t maxEpoch = clusterGetMaxEpoch();
+
+    if (myself->configEpoch == 0 ||
+        myself->configEpoch != maxEpoch)
+    {
+        server.cluster->currentEpoch++;
+        myself->configEpoch = server.cluster->currentEpoch;
+        clusterDoBeforeSleep(CLUSTER_TODO_SAVE_CONFIG|
+                             CLUSTER_TODO_FSYNC_CONFIG);
+        clsLog(LOG_WARNING,
+            "New configEpoch set to %llu",
+            (unsigned long long) myself->configEpoch);
+        return C_OK;
+    } else {
+        return C_ERR;
+    }
+}
+
+/* This function is called when this node is a master, and we receive from
+ * another master a configuration epoch that is equal to our configuration
+ * epoch.
+ *
+ * BACKGROUND
+ *
+ * It is not possible that different slaves get the same config
+ * epoch during a failover election, because the slaves need to get voted
+ * by a majority. However when we perform a manual resharding of the cluster
+ * the node will assign a configuration epoch to itself without to ask
+ * for agreement. Usually resharding happens when the cluster is working well
+ * and is supervised by the sysadmin, however it is possible for a failover
+ * to happen exactly while the node we are resharding a slot to assigns itself
+ * a new configuration epoch, but before it is able to propagate it.
+ *
+ * So technically it is possible in this condition that two nodes end with
+ * the same configuration epoch.
+ *
+ * Another possibility is that there are bugs in the implementation causing
+ * this to happen.
+ *
+ * Moreover when a new cluster is created, all the nodes start with the same
+ * configEpoch. This collision resolution code allows nodes to automatically
+ * end with a different configEpoch at startup automatically.
+ *
+ * In all the cases, we want a mechanism that resolves this issue automatically
+ * as a safeguard. The same configuration epoch for masters serving different
+ * set of slots is not harmful, but it is if the nodes end serving the same
+ * slots for some reason (manual errors or software bugs) without a proper
+ * failover procedure.
+ *
+ * In general we want a system that eventually always ends with different
+ * masters having different configuration epochs whatever happened, since
+ * nothign is worse than a split-brain condition in a distributed system.
+ *
+ * BEHAVIOR
+ *
+ * When this function gets called, what happens is that if this node
+ * has the lexicographically smaller Node ID compared to the other node
+ * with the conflicting epoch (the 'sender' node), it will assign itself
+ * the greatest configuration epoch currently detected among nodes plus 1.
+ *
+ * This means that even if there are multiple nodes colliding, the node
+ * with the greatest Node ID never moves forward, so eventually all the nodes
+ * end with a different configuration epoch.
+ */
+static void clusterHandleConfigEpochCollision(clusterNode *sender) {
+    /* Prerequisites: nodes have the same configEpoch and are both masters. */
+    if (sender->configEpoch != myself->configEpoch ||
+        !nodeIsMaster(sender) || !nodeIsMaster(myself)) return;
+    /* Don't act if the colliding node has a smaller Node ID. */
+    if (memcmp(sender->name,myself->name,CLUSTER_NAMELEN) <= 0) return;
+    /* Get the next ID available at the best of this node knowledge. */
+    server.cluster->currentEpoch++;
+    myself->configEpoch = server.cluster->currentEpoch;
+    clusterSaveConfigOrDie(1);
+    clsLog(LOG_WARNING,
+        "WARNING: configEpoch collision with node %.40s."
+        " configEpoch set to %llu",
+        sender->name,
+        (unsigned long long) myself->configEpoch);
 }
 
 /* -----------------------------------------------------------------------------
@@ -2240,8 +2370,138 @@ static int clusterProcessPacket(clusterLink *link) {
          *    need to update our configuration. */
         if (sender && nodeIsMaster(sender) && dirty_slots)
             clusterUpdateSlotsConfigWith(sender, senderConfigEpoch, hdr->myslots);
-    } else if (type == CLUSTERMSG_TYPE_FAIL) {
+        
+        /* 2) We also check for the reverse condition, that is, the sender
+         *    claims to serve slots we know are served by a master with a
+         *    greater configEpoch. If this happens we inform the sender.
+         *
+         * This is useful because sometimes after a partition heals, a
+         * reappearing master may be the last one to claim a given set of
+         * hash slots, but with a configuration that other instances know to
+         * be deprecated. Example:
+         *
+         * A and B are master and slave for slots 1,2,3.
+         * A is partitioned away, B gets promoted.
+         * B is partitioned away, and A returns available.
+         *
+         * Usually B would PING A publishing its set of served slots and its
+         * configEpoch, but because of the partition B can't inform A of the
+         * new configuration, so other nodes that have an updated table must
+         * do it. In this way A will stop to act as a master (or can try to
+         * failover if there are the conditions to win the election). */
+        if (sender && dirty_slots) {
+            int j;
 
+            for (j = 0; j < CLUSTER_SLOTS; j++) {
+                if (bitmapTestBit(hdr->myslots, j)) {
+                    if (server.cluster->slots[j] == sender ||
+                        server.cluster->slots[j] == NULL) continue;
+                    if (server.cluster->slots[j]->configEpoch > senderConfigEpoch) {
+                        clsLog(LOG_WARNING,
+                            "Node %.40s has old slots configuration, sending "
+                            "an UPDATE message about %.40s",
+                                sender->name, server.cluster->slots[j]->name);
+                        clusterSendUpdate(sender->link, server.cluster->slots[j]);
+
+                        /* TODO: instead of exiting the loop send every other
+                         * UPDATE packet for other nodes that are the new owner
+                         * of sender's slots. */
+                        break;
+                    }
+                }
+            }
+        }
+
+        /* If our config epoch collides with the sender's try to fix
+         * the problem. */
+        if (sender &&
+            nodeIsMaster(myself) &&
+            nodeIsMaster(sender) &&
+            senderConfigEpoch == myself->configEpoch)
+        {
+            clusterHandleConfigEpochCollision(sender);
+        }
+
+        /* Get info from the gossip section */
+        if (sender) clusterProcessGossipSection(hdr,link);
+    } else if (type == CLUSTERMSG_TYPE_FAIL) {
+        clusterNode *failing;
+
+        if (sender) {
+            failing = clusterLookupNode(hdr->data.fail.about.nodename);
+            if (failing &&
+                !(failing->flags & (CLUSTER_NODE_FAIL|CLUSTER_NODE_MYSELF))) 
+            {
+                clsLog(LOG_NOTICE,
+                    "FAIL message received from %.40s about %.40s",
+                    hdr->sender, hdr->data.fail.about.nodename);
+                failing->flags |= CLUSTER_NODE_FAIL;
+                failing->fail_time = mstime();
+                failing->flags &= ~CLUSTER_NODE_PFAIL;
+                clusterDoBeforeSleep(CLUSTER_TODO_SAVE_CONFIG|
+                                     CLUSTER_TODO_UPDATE_STATE);
+            }
+        } else {
+            clsLog(LOG_NOTICE,
+                "Ignoring FAIL message from unknown node %.40s about %.40s",
+                hdr->sender, hdr->data.fail.about.nodename);
+        }
+    } else if (type == CLUSTERMSG_TYPE_PUBLISH) {
+
+    } else if (type == CLUSTERMSG_TYPE_FAILOVER_AUTH_REQUEST) {
+        if (!sender) return 1;  /* We don't know that node. */
+        clusterSendFailoverAuthIfNeeded(sender,hdr);
+    } else if (type == CLUSTERMSG_TYPE_FAILOVER_AUTH_ACK) {
+        if (!sender) return 1;  /* We don't know that node. */
+        /* We consider this vote only if the sender is a master serving
+         * a non zero number of slots, and its currentEpoch is greater or
+         * equal to epoch where this node started the election. */
+        if (nodeIsMaster(sender) &&
+            sender->numslots > 0 &&
+            senderCurrentEpoch >= server.cluster->failover_auth_epoch) 
+        {
+            server.cluster->failover_auth_count++;
+            /* Maybe we reached a quorum here, set a flag to make sure
+             * we check ASAP. */
+            clusterDoBeforeSleep(CLUSTER_TODO_HANDLE_FAILOVER);
+        }
+    } else if (type == CLUSTERMSG_TYPE_MFSTART) {
+        /* This message is acceptable only if I'm a master and the sender
+         * is one of my slaves. */
+        if (!sender || sender->slaveof != myself) return 1;
+        /* Manual failover requested from slaves. Initialize the state
+         * accordingly. */
+        resetManualFailover();
+        server.cluster->mf_end = mstime() + CLUSTER_MF_TIMEOUT;
+        server.cluster->mf_slave = sender;
+        // pauseClients(mstime()+(CLUSTER_MF_TIMEOUT*2));
+        clsLog(LOG_WARNING,"Manual failover requested by replica %.40s.",
+            sender->name);
+    } else if (type == CLUSTERMSG_TYPE_UPDATE) {
+        clusterNode *n; /* The node the update is about. */
+        uint64_t reportedConfigEpoch = 
+                    ntohu64(hdr->data.update.nodecfg.configEpoch);
+        if (!sender) return 1; /* We don't know the sender. */
+        n = clusterLookupNode(hdr->data.update.nodecfg.nodename);
+        if (!n) return 1; /* We don't know the reported node. */
+        if (n->configEpoch >= reportedConfigEpoch) return 1; /* Nothing new. */
+
+        /* If in our current config the node is a slave, set it as a master. */
+        if (nodeIsSlave(n)) clusterSetNodeAsMaster(n);
+
+        /* Update the node's configEpoch. */
+        n->configEpoch = reportedConfigEpoch;
+        clusterDoBeforeSleep(CLUSTER_TODO_SAVE_CONFIG|
+                             CLUSTER_TODO_FSYNC_CONFIG);
+        
+        /* Check the bitmap of served slots and update our
+         * config accordingly. */
+        clusterUpdateSlotsConfigWith(n,reportedConfigEpoch,
+            hdr->data.update.nodecfg.slots);
+    } else if (type == CLUSTERMSG_TYPE_MODULE) {
+        if (!sender) return 1;  /* Protect the module from unknown nodes. */
+    } else {
+        clsLog(LOG_WARNING,"Received unknown packet type: %d", type);
     }
     return 1;
 }
@@ -3489,6 +3749,71 @@ static void clusterSetMaster(clusterNode *n) {
     resetManualFailover();
 }
 
+/* -----------------------------------------------------------------------------
+ * CLUSTER cron job
+ * -------------------------------------------------------------------------- */
+
+/* This is executed 10 times every second */
+void clusterCron(void) {
+    dictIterator *di;
+    dictEntry *de;
+    int update_state = 0;
+    int orphaned_masters; /* How many masters there are without ok slaves. */
+    int max_slaves; /* Max number of ok slaves for a single master. */
+    int this_slaves; /* Number of ok slaves for our master (if we are slave). */
+    mstime_t min_pong = 0, now = mstime();
+    clusterNode *min_pong_node = NULL;
+    static unsigned long long iteration = 0;
+    mstime_t handshake_timeout;
+
+    iteration++; /* Number of times this function was called so far. */
+
+    /* We want to take myself->ip in sync with the cluster-announce-ip option.
+     * The option can be set at runtime via CONFIG SET, so we periodically check
+     * if the option changed to reflect this into myself->ip. */
+    {
+        static char *prev_ip = NULL;
+        char *curr_ip = server.cluster_announce_ip;
+        int changed = 0;
+
+        if (prev_ip == NULL && curr_ip != NULL) changed = 1;
+        else if (prev_ip != NULL && curr_ip == NULL) changed = 1;
+        else if (prev_ip && curr_ip && strcmp(prev_ip, curr_ip)) changed = 1;
+
+        if (changed) {
+            if (prev_ip) zfree(prev_ip);
+            prev_ip = curr_ip;
+
+            if (curr_ip) {
+                /* We always take a copy of the previous IP address, by
+                 * duplicating the string. This way later we can check if
+                 * the address really changed. */
+                prev_ip = zstrdup(prev_ip);
+                strncpy(myself->ip, server.cluster_announce_ip, NET_IP_STR_LEN);
+                myself->ip[NET_IP_STR_LEN-1] = '\0';
+            } else {
+                myself->ip[0] = '\0';
+            }
+        }
+    }
+
+    /* The handshake timeout is the time after which a handshake node that was
+     * not turned into a normal node is removed from the nodes. Usually it is
+     * just the NODE_TIMEOUT value, but when NODE_TIMEOUT is too small we use
+     * the value of 1 second. */
+    handshake_timeout = server.cluster_node_timeout;
+    if (handshake_timeout < 1000) handshake_timeout = 1000;
+
+    /* Update myself flags. */
+    clusterUpdateMyselfFlags();
+
+    /* Check if we have disconnected nodes and re-establish the connection.
+     * Also update a few stats while we are here, that can be used to make
+     * better decisions in other part of the code. */
+    di = dictGetSafeIterator(server.cluster->nodes);
+    server.cluster->stats_pfail_nodes = 0;
+}
+
 
 /***************************SOCKET***************************************/
 /* Initialize a set of file descriptors to listen to the specified 'port'
@@ -3650,6 +3975,19 @@ void clsInit(void) {
     server.cluster->slots_to_keys = raxNew();
     memset(server.cluster->slots_keys_count,0,
            sizeof(server.cluster->slots_keys_count));
+    
+    /* Set myself->port / cport to my listening ports, we'll just need to
+     * discover the IP address via MEET messages. */
+    myself->port = server.port;
+    myself->cport = server.port+CLUSTER_PORT_INCR;
+    if (server.cluster_announce_port)
+        myself->port = server.cluster_announce_port;
+    if (server.cluster_announce_bus_port)
+        myself->cport = server.cluster_announce_bus_port;
+    
+    server.cluster->mf_end = 0;
+    resetManualFailover();
+    clusterUpdateMyselfFlags();
 }
 
 void clsSetLogLevel(int level) {
