@@ -351,6 +351,7 @@ struct Server {
     /* time cache */
     time_t unixtime;            /* Unix time sampled every cron cycle. */
     time_t timezone;
+    int daylight_active;    /* Currently in daylight saving time. */
     long long mstime;           /* Like 'unixtime' but with milliseconds resolution. */
     /* Networking */
     int port;                   /* TCP listening port */
@@ -567,6 +568,16 @@ static void nolocks_localtime(struct tm *tmp, time_t t, time_t tz, int dst) {
     tmp->tm_year -= 1900;   /* Surprisingly tm_year is year-1900. */
 }
 
+static const char *getColor(int level) {
+    switch (level & 0x03) {
+        case 0: return "\033[31m";  // 红色
+        case 1: return "\033[32m";  // 绿色
+        case 2: return "\033[33m";  // 黄色
+        case 3: return "\033[32m";  // 绿色
+        default: return "\033[0m";  // 重置
+    }
+}
+
 /* Low level logging. To use only for very big messages, otherwise
  * clsLog() is to prefer. */
 static void clsLogRaw(int level, const char *msg) {
@@ -587,12 +598,14 @@ static void clsLogRaw(int level, const char *msg) {
 
         gettimeofday(&tv, NULL);
         struct tm tm;
-        time_t daylight_active;
-        nolocks_localtime(&tm, tv.tv_sec, server.timezone, daylight_active);
+        nolocks_localtime(&tm, tv.tv_sec, server.timezone, server.daylight_active);
         off = strftime(buf,sizeof(buf),"%d %b %Y %H:%M:%S.",&tm);
         snprintf(buf+off, sizeof(buf)-off, "%03d", (int)tv.tv_usec/1000);
-        fprintf(fp,"%d: %s %c %s\n",
-            (int)getpid(), buf,c[level],msg);
+        // fprintf(fp,"%d: %s %c %s\n",
+        //     (int)getpid(), buf,c[level & 0x03],msg);
+        
+        fprintf(fp, "%s%d: %s %c %s\033[0m\n", 
+            getColor(level), (int)getpid(), buf, c[level & 0x03], msg);
     }
     fflush(fp);
     // fclose(fp);
