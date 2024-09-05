@@ -25,11 +25,15 @@
  * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
  * POSSIBILITY OF SUCH DAMAGE.
  */
-#ifndef __CLS_H__
-#define __CLS_H__
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <cls.h>
 
-void clsInit(int port, const char *configfile);
-int clsStart(void);
-void clsSetLogLevel(int level);
-
-#endif
+int main(int argc, char *argv[]) {
+    clsSetLogLevel(0);
+    clsInit(atoi(argv[1]), argv[2]);
+    clsStart();
+    return 0;
+}

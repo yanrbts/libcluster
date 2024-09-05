@@ -346,6 +346,8 @@ typedef struct {
 
 struct Server {
     int verbosity;
+    int hz;                     /* serverCron() calls frequency in hertz */
+    int cronloops;              /* Number of times the cron function run */
     /* time cache */
     time_t unixtime;            /* Unix time sampled every cron cycle. */
     time_t timezone;
@@ -484,6 +486,8 @@ static void clusterUpdateState(void);
 static void resetManualFailover(void);
 static void manualFailoverCheckTimeout(void);
 static void clusterHandleManualFailover(void);
+static void clusterHandleSlaveFailover(void);
+static void clusterHandleSlaveMigration(int max_slaves);
 static unsigned int countKeysInSlot(unsigned int hashslot);
 static unsigned int delKeysInSlot(unsigned int hashslot);
 
@@ -591,7 +595,7 @@ static void clsLogRaw(int level, const char *msg) {
             (int)getpid(), buf,c[level],msg);
     }
     fflush(fp);
-    fclose(fp);
+    // fclose(fp);
 }
 
 /* Like serverLogRaw() but with printf-alike support. This is the function that
@@ -1946,11 +1950,11 @@ static int clusterGetSlaveRank(void) {
     master = myself->slaveof;
     if (master == NULL) return 0; /* Never called by slaves without master. */
 
-    myoffset = replicationGetSlaveOffset();
+    // myoffset = replicationGetSlaveOffset();
     for (j = 0; j < master->numslaves; j++) {
         if (master->slaves[j] != myself &&
-            !nodeCantFailover(master->slaves[j]) &&
-            master->slaves[j]->repl_offset > myoffset)
+            !nodeCantFailover(master->slaves[j]) 
+            /*&& master->slaves[j]->repl_offset > myoffset*/)
             rank++;
     }
     return rank;
@@ -2053,6 +2057,266 @@ static void clusterFailoverReplaceYourMaster(void) {
 
     /* 5) If there was a manual failover in progress, clear the state. */
     resetManualFailover();
+}
+
+/* This function is called if we are a slave node and our master serving
+ * a non-zero amount of hash slots is in FAIL state.
+ *
+ * The gaol of this function is:
+ * 1) To check if we are able to perform a failover, is our data updated?
+ * 2) Try to get elected by masters.
+ * 3) Perform the failover informing all the other nodes.
+ */
+static void clusterHandleSlaveFailover(void) {
+    mstime_t data_age;
+    mstime_t auth_age = mstime() - server.cluster->failover_auth_time;
+    int needed_quorum = (server.cluster->size / 2) + 1;
+    int manual_failover = server.cluster->mf_end != 0 &&
+                          server.cluster->mf_can_start;
+    mstime_t auth_timeout, auth_retry_time;
+
+    server.cluster->todo_before_sleep &= ~CLUSTER_TODO_HANDLE_FAILOVER;
+
+    /* Compute the failover timeout (the max time we have to send votes
+     * and wait for replies), and the failover retry time (the time to wait
+     * before trying to get voted again).
+     *
+     * Timeout is MAX(NODE_TIMEOUT*2,2000) milliseconds.
+     * Retry is two times the Timeout.
+     */
+    auth_timeout = server.cluster_node_timeout*2;
+    if (auth_timeout < 2000) auth_timeout = 2000;
+    auth_retry_time = auth_timeout*2;
+
+    /* Pre conditions to run the function, that must be met both in case
+     * of an automatic or manual failover:
+     * 1) We are a slave.
+     * 2) Our master is flagged as FAIL, or this is a manual failover.
+     * 3) We don't have the no failover configuration set, and this is
+     *    not a manual failover.
+     * 4) It is serving slots. */
+    if (nodeIsMaster(myself) ||
+        myself->slaveof == NULL ||
+        (!nodeFailed(myself->slaveof) && !manual_failover) ||
+        (server.cluster_slave_no_failover && !manual_failover) ||
+        myself->slaveof->numslots == 0)
+    {
+        /* There are no reasons to failover, so we set the reason why we
+         * are returning without failing over to NONE. */
+        server.cluster->cant_failover_reason = CLUSTER_CANT_FAILOVER_NONE;
+        return;
+    }
+
+    /* If the previous failover attempt timedout and the retry time has
+     * elapsed, we can setup a new one. */
+    if (auth_age > auth_retry_time) {
+        server.cluster->failover_auth_time = mstime() +
+            500 + /* Fixed delay of 500 milliseconds, let FAIL msg propagate. */
+            random() % 500; /* Random delay between 0 and 500 milliseconds. */
+        server.cluster->failover_auth_count = 0;
+        server.cluster->failover_auth_sent = 0;
+        server.cluster->failover_auth_rank = clusterGetSlaveRank();
+        /* We add another delay that is proportional to the slave rank.
+         * Specifically 1 second * rank. This way slaves that have a probably
+         * less updated replication offset, are penalized. */
+        server.cluster->failover_auth_time +=
+            server.cluster->failover_auth_rank * 1000;
+        /* However if this is a manual failover, no delay is needed. */
+        if (server.cluster->mf_end) {
+            server.cluster->failover_auth_time = mstime();
+            server.cluster->failover_auth_rank = 0;
+        }
+        clsLog(LOG_WARNING,
+            "Start of election delayed for %lld milliseconds "
+            "(rank #%d, offset %lld).",
+            server.cluster->failover_auth_time - mstime(),
+            server.cluster->failover_auth_rank
+            /*replicationGetSlaveOffset()*/);
+        /* Now that we have a scheduled election, broadcast our offset
+         * to all the other slaves so that they'll updated their offsets
+         * if our offset is better. */
+        clusterBroadcastPong(CLUSTER_BROADCAST_LOCAL_SLAVES);
+        return;
+    }
+
+    /* It is possible that we received more updated offsets from other
+     * slaves for the same master since we computed our election delay.
+     * Update the delay if our rank changed.
+     *
+     * Not performed if this is a manual failover. */
+    if (server.cluster->failover_auth_sent == 0 &&
+        server.cluster->mf_end == 0)
+    {
+        int newrank = clusterGetSlaveRank();
+        if (newrank > server.cluster->failover_auth_rank) {
+            long long added_delay =
+                (newrank - server.cluster->failover_auth_rank) * 1000;
+            server.cluster->failover_auth_time += added_delay;
+            server.cluster->failover_auth_rank = newrank;
+            clsLog(LOG_WARNING,
+                "Replica rank updated to #%d, added %lld milliseconds of delay.",
+                newrank, added_delay);
+        }
+    }
+
+    /* Return ASAP if we can't still start the election. */
+    if (mstime() < server.cluster->failover_auth_time) {
+        clusterLogCantFailover(CLUSTER_CANT_FAILOVER_WAITING_DELAY);
+        return;
+    }
+
+    /* Return ASAP if the election is too old to be valid. */
+    if (auth_age > auth_timeout) {
+        clusterLogCantFailover(CLUSTER_CANT_FAILOVER_EXPIRED);
+        return;
+    }
+
+    /* Ask for votes if needed. */
+    if (server.cluster->failover_auth_sent == 0) {
+        server.cluster->currentEpoch++;
+        server.cluster->failover_auth_epoch = server.cluster->currentEpoch;
+        clsLog(LOG_WARNING,"Starting a failover election for epoch %llu.",
+            (unsigned long long) server.cluster->currentEpoch);
+        clusterRequestFailoverAuth();
+        server.cluster->failover_auth_sent = 1;
+        clusterDoBeforeSleep(CLUSTER_TODO_SAVE_CONFIG|
+                             CLUSTER_TODO_UPDATE_STATE|
+                             CLUSTER_TODO_FSYNC_CONFIG);
+        return; /* Wait for replies. */
+    }
+
+    /* Check if we reached the quorum. */
+    if (server.cluster->failover_auth_count >= needed_quorum) {
+        /* We have the quorum, we can finally failover the master. */
+
+        clsLog(LOG_WARNING,
+            "Failover election won: I'm the new master.");
+
+        /* Update my configEpoch to the epoch of the election. */
+        if (myself->configEpoch < server.cluster->failover_auth_epoch) {
+            myself->configEpoch = server.cluster->failover_auth_epoch;
+            clsLog(LOG_WARNING,
+                "configEpoch set to %llu after successful failover",
+                (unsigned long long) myself->configEpoch);
+        }
+
+        /* Take responsibility for the cluster slots. */
+        clusterFailoverReplaceYourMaster();
+    } else {
+        clusterLogCantFailover(CLUSTER_CANT_FAILOVER_WAITING_VOTES);
+    }
+}
+
+/* -----------------------------------------------------------------------------
+ * CLUSTER slave migration
+ *
+ * Slave migration is the process that allows a slave of a master that is
+ * already covered by at least another slave, to "migrate" to a master that
+ * is orpaned, that is, left with no working slaves.
+ * ------------------------------------------------------------------------- */
+
+/* This function is responsible to decide if this replica should be migrated
+ * to a different (orphaned) master. It is called by the clusterCron() function
+ * only if:
+ *
+ * 1) We are a slave node.
+ * 2) It was detected that there is at least one orphaned master in
+ *    the cluster.
+ * 3) We are a slave of one of the masters with the greatest number of
+ *    slaves.
+ *
+ * This checks are performed by the caller since it requires to iterate
+ * the nodes anyway, so we spend time into clusterHandleSlaveMigration()
+ * if definitely needed.
+ *
+ * The fuction is called with a pre-computed max_slaves, that is the max
+ * number of working (not in FAIL state) slaves for a single master.
+ *
+ * Additional conditions for migration are examined inside the function.
+ */
+static void clusterHandleSlaveMigration(int max_slaves) {
+    int j, okslaves = 0;
+    clusterNode *mymaster = myself->slaveof, *target = NULL, *candidate = NULL;
+    dictIterator *di;
+    dictEntry *de;
+
+    /* Step 1: Don't migrate if the cluster state is not ok. */
+    if (server.cluster->state != CLUSTER_OK) return;
+
+    /* Step 2: Don't migrate if my master will not be left with at least
+     *         'migration-barrier' slaves after my migration. */
+    if (mymaster == NULL) return;
+    for (j = 0; j < mymaster->numslaves; j++)
+        if (!nodeFailed(mymaster->slaves[j]) &&
+            !nodeTimedOut(mymaster->slaves[j])) okslaves++;
+    if (okslaves <= server.cluster_migration_barrier) return;
+
+    /* Step 3: Identify a candidate for migration, and check if among the
+     * masters with the greatest number of ok slaves, I'm the one with the
+     * smallest node ID (the "candidate slave").
+     *
+     * Note: this means that eventually a replica migration will occur
+     * since slaves that are reachable again always have their FAIL flag
+     * cleared, so eventually there must be a candidate. At the same time
+     * this does not mean that there are no race conditions possible (two
+     * slaves migrating at the same time), but this is unlikely to
+     * happen, and harmless when happens. */
+    candidate = myself;
+    di = dictGetSafeIterator(server.cluster->nodes);
+    while((de = dictNext(di)) != NULL) {
+        clusterNode *node = dictGetVal(de);
+        int okslaves = 0, is_orphaned = 1;
+
+        /* We want to migrate only if this master is working, orphaned, and
+         * used to have slaves or if failed over a master that had slaves
+         * (MIGRATE_TO flag). This way we only migrate to instances that were
+         * supposed to have replicas. */
+        if (nodeIsSlave(node) || nodeFailed(node)) is_orphaned = 0;
+        if (!(node->flags & CLUSTER_NODE_MIGRATE_TO)) is_orphaned = 0;
+
+        /* Check number of working slaves. */
+        if (nodeIsMaster(node)) okslaves = clusterCountNonFailingSlaves(node);
+        if (okslaves > 0) is_orphaned = 0;
+
+        if (is_orphaned) {
+            if (!target && node->numslots > 0) target = node;
+
+            /* Track the starting time of the orphaned condition for this
+             * master. */
+            if (!node->orphaned_time) node->orphaned_time = mstime();
+        } else {
+            node->orphaned_time = 0;
+        }
+
+        /* Check if I'm the slave candidate for the migration: attached
+         * to a master with the maximum number of slaves and with the smallest
+         * node ID. */
+        if (okslaves == max_slaves) {
+            for (j = 0; j < node->numslaves; j++) {
+                if (memcmp(node->slaves[j]->name,
+                           candidate->name,
+                           CLUSTER_NAMELEN) < 0)
+                {
+                    candidate = node->slaves[j];
+                }
+            }
+        }
+    }
+    dictReleaseIterator(di);
+
+    /* Step 4: perform the migration if there is a target, and if I'm the
+     * candidate, but only if the master is continuously orphaned for a
+     * couple of seconds, so that during failovers, we give some time to
+     * the natural slaves of this instance to advertise their switch from
+     * the old master to the new one. */
+    if (target && candidate == myself &&
+        (mstime()-target->orphaned_time) > CLUSTER_SLAVE_MIGRATION_DELAY &&
+       !(server.cluster_module_flags & CLUSTER_MODULE_FLAG_NO_FAILOVER))
+    {
+        clsLog(LOG_WARNING,"Migrating to orphaned master %.40s",
+            target->name);
+        clusterSetMaster(target);
+    }
 }
 
 /* When this function is called, there is a packet to process starting
@@ -2681,14 +2945,14 @@ static void clusterHandleManualFailover(void) {
 
     if (server.cluster->mf_master_offset == 0) return; /* Wait for offset... */
 
-    if (server.cluster->mf_master_offset == replicationGetSlaveOffset()) {
-        /* Our replication offset matches the master replication offset
-         * announced after clients were paused. We can start the failover. */
-        server.cluster->mf_can_start = 1;
-        clsLog(LOG_WARNING,
-            "All master replication stream processed, "
-            "manual failover can start.");
-    }
+    // if (server.cluster->mf_master_offset == replicationGetSlaveOffset()) {
+    //     /* Our replication offset matches the master replication offset
+    //      * announced after clients were paused. We can start the failover. */
+    //     server.cluster->mf_can_start = 1;
+    //     clsLog(LOG_WARNING,
+    //         "All master replication stream processed, "
+    //         "manual failover can start.");
+    // }
 }
 
 /* -----------------------------------------------------------------------------
@@ -4113,14 +4377,79 @@ int listenToPort(int port, int *fds, int *count) {
     return C_OK;
 }
 
+/* This function is called before the event handler returns to sleep for
+ * events. It is useful to perform operations that must be done ASAP in
+ * reaction to events fired but that are not safe to perform inside event
+ * handlers, or to perform potentially expansive tasks that we need to do
+ * a single time before replying to clients. */
+static void clusterBeforeSleep(void) {
+    /* Handle failover, this is needed when it is likely that there is already
+     * the quorum from masters in order to react fast. */
+    if (server.cluster->todo_before_sleep & CLUSTER_TODO_HANDLE_FAILOVER)
+        clusterHandleSlaveFailover();
+
+    /* Update the cluster state. */
+    if (server.cluster->todo_before_sleep & CLUSTER_TODO_UPDATE_STATE)
+        clusterUpdateState();
+
+    /* Save the config, possibly using fsync. */
+    if (server.cluster->todo_before_sleep & CLUSTER_TODO_SAVE_CONFIG) {
+        int fsync = server.cluster->todo_before_sleep &
+                    CLUSTER_TODO_FSYNC_CONFIG;
+        clusterSaveConfigOrDie(fsync);
+    }
+
+    /* Reset our flags (not strictly needed since every single function
+     * called for flags set should be able to clear its flag). */
+    server.cluster->todo_before_sleep = 0;
+}
+
+/* This function gets called every time Redis is entering the
+ * main loop of the event driven library, that is, before to sleep
+ * for ready file descriptors. */
+static void beforeSleep(struct aeEventLoop *eventLoop) {
+    UNUSED(eventLoop);
+    clusterBeforeSleep();
+}
+
+/* This function is called immadiately after the event loop multiplexing
+ * API returned, and the control is going to soon return to Redis by invoking
+ * the different events callbacks. */
+void afterSleep(struct aeEventLoop *eventLoop) {
+    UNUSED(eventLoop);
+}
+
+/* Using the following macro you can run code inside serverCron() with the
+ * specified period, specified in milliseconds.
+ * The actual resolution depends on server.hz. */
+#define run_with_period(_ms_) if ((_ms_ <= 1000/server.hz) || !(server.cronloops%((_ms_)/(1000/server.hz))))
+
+static int serverTimeCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
+    UNUSED(eventLoop);
+    UNUSED(id);
+    UNUSED(clientData);
+
+    if ((100 <= 1000/server.hz) || !(server.cronloops%((100)/(1000/server.hz)))) {
+        clusterCron();
+    } else {
+        clsLog(LOG_NOTICE, "cronloops %d", server.cronloops);
+    }
+    server.cronloops++;
+    return 1000/server.hz;
+}
+
 /* ---------------------- API exported outside -------------------- */
-void clsInit(void) {
+void clsInit(int port, const char *configfile) {
     int saveconf = 0;
     /* Populates 'timezone' global. */
     tzset();
     server.timezone = timezone;
-    server.port = 7379;
+    server.port = port;
 
+    server.hz = 1;
+    server.cronloops = 0;
+    server.cluster_configfile = zstrdup(configfile);
+    server.el = aeCreateEventLoop(64);
     server.cluster = zmalloc(sizeof(struct clusterState));
     server.cluster->myself = NULL;
     server.cluster->currentEpoch = 0;
@@ -4179,6 +4508,7 @@ void clsInit(void) {
 
     if (listenToPort(server.port+CLUSTER_PORT_INCR,
         server.cfd, &server.cfd_count) == C_ERR) {
+        clsLog(LOG_ERR, "Port %d Already in use", server.port+CLUSTER_PORT_INCR);
         exit(1);
     } else {
         int j;
@@ -4191,6 +4521,14 @@ void clsInit(void) {
                 exit(1);
             }
         }
+    }
+
+    /* Create the timer callback, this is our way to process many background
+     * operations incrementally, like clients timeout, eviction of unaccessed
+     * expired keys and so forth. */
+    if (aeCreateTimeEvent(server.el, 1, serverTimeCron, NULL, NULL) == AE_ERR) {
+        clsLog(LOG_ERR, "Can't create event loop timers.");
+        exit(1);
     }
 
     /* The slots -> keys map is a radix tree. Initialize it here. */
@@ -4211,9 +4549,16 @@ void clsInit(void) {
     resetManualFailover();
     clusterUpdateMyselfFlags();
 }
+/* Enable cluster services */
+int clsStart(void) {
+    aeSetBeforeSleepProc(server.el, beforeSleep);
+    aeSetAfterSleepProc(server.el, afterSleep);
+    aeMain(server.el);
+    aeDeleteEventLoop(server.el);
+}
 
 void clsSetLogLevel(int level) {
     if (level < LOG_EMERG || level > LOG_DEBUG)
-        level = LOG_ERR;
+        level = LOG_EMERG;
     server.verbosity = level;
 }

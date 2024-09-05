@@ -12,6 +12,7 @@ set(SOURCE_FILES
     cls_sds.c 
     cls_util.c
     endianconv.c
+    siphash.c
     sha1.c
 )
 

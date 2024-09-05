@@ -41,5 +41,5 @@
 #  include_directories(${CMAKE_SOURCE_DIR}/test/Unity)
  
  add_subdirectory(src)
-#  add_subdirectory(test)
+ add_subdirectory(example)
  
