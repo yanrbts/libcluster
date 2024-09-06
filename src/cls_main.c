@@ -491,6 +491,7 @@ static void clusterHandleSlaveFailover(void);
 static void clusterHandleSlaveMigration(int max_slaves);
 static unsigned int countKeysInSlot(unsigned int hashslot);
 static unsigned int delKeysInSlot(unsigned int hashslot);
+static const char *clusterGetMessageTypeString(int type);
 
 /*============================ Utility functions ============================ */
 
@@ -4451,6 +4452,22 @@ static int serverTimeCron(struct aeEventLoop *eventLoop, long long id, void *cli
     return 1000/server.hz;
 }
 
+static const char *clusterGetMessageTypeString(int type) {
+    switch(type) {
+    case CLUSTERMSG_TYPE_PING: return "ping";
+    case CLUSTERMSG_TYPE_PONG: return "pong";
+    case CLUSTERMSG_TYPE_MEET: return "meet";
+    case CLUSTERMSG_TYPE_FAIL: return "fail";
+    case CLUSTERMSG_TYPE_PUBLISH: return "publish";
+    case CLUSTERMSG_TYPE_FAILOVER_AUTH_REQUEST: return "auth-req";
+    case CLUSTERMSG_TYPE_FAILOVER_AUTH_ACK: return "auth-ack";
+    case CLUSTERMSG_TYPE_UPDATE: return "update";
+    case CLUSTERMSG_TYPE_MFSTART: return "mfstart";
+    case CLUSTERMSG_TYPE_MODULE: return "module";
+    }
+    return "unknown";
+}
+
 /* ---------------------- API exported outside -------------------- */
 void clsInit(int port, const char *configfile) {
     int saveconf = 0;
@@ -4568,10 +4585,145 @@ int clsStart(void) {
     aeSetAfterSleepProc(server.el, afterSleep);
     aeMain(server.el);
     aeDeleteEventLoop(server.el);
+    return C_OK;
 }
 
 void clsSetLogLevel(int level) {
     if (level < LOG_EMERG || level > LOG_DEBUG)
         level = LOG_EMERG;
     server.verbosity = level;
+}
+
+int clsSetMeet(char *ip, int port) {
+    int cport;
+
+    /* Port sanity check II
+     * The other handshake port check is triggered too late to stop
+     * us from trying to use a too-high cluster port number. */
+    if (port > (65535-CLUSTER_PORT_INCR)) {
+        clsLog(LOG_WARNING, "CLS port number too high. "
+                   "Cluster communication port is 10,000 port "
+                   "numbers higher than your Server port. "
+                   "Your CLS port number must be "
+                   "lower than 55535.");
+        return C_ERR;
+    }
+
+    /* Cluster communication port is 10,000 port 
+     * numbers higher than your Server port. */
+    cport = port+CLUSTER_PORT_INCR;
+
+    if (clusterStartHandshake(ip, port, cport) == 0 &&
+        errno == EINVAL)
+    {
+        clsLog(LOG_ERR, "Invalid node address specified: %s:%d",
+                ip, port);
+        return C_ERR;
+    }
+
+    return C_OK;
+}
+
+char *clsGetSelfNodeId(void) {
+    return myself->name;
+}
+
+char *clsGetNodesDescription(void) {
+    sds ci = clusterGenNodesDescription(0);
+    return ci;
+}
+
+void clsFree(void *ptr) {
+    if (ptr == NULL) return;
+    zfree(ptr);
+}
+
+char *clsGetSlaves(const char *masterid) {
+    int j;
+    sds buf;
+    clusterNode *n = clusterLookupNode(masterid);
+
+    if (!n) {
+        clsLog(LOG_ERR, "Unknown node %s", masterid);
+        return NULL;
+    }
+
+    if (nodeIsSlave(n)) {
+        clsLog(LOG_ERR, "The specified node(%s) is not a master", masterid);
+        return NULL;
+    }
+
+    buf = sdsempty();
+    for (j = 0; j < n->numslaves; j++) {
+        sds ni = clusterGenNodeDescription(n->slaves[j]);
+        buf = sdscatlen(buf, ni, sdslen(ni));
+        buf = sdscatlen(buf, "\r\n", 2);
+        sdsfree(ni);
+    }
+    return buf;
+}
+
+char *clsGetInfo(void) {
+    /* CLUSTER INFO */
+    char *statestr[] = {"ok","fail","needhelp"};
+    int slots_assigned = 0, slots_ok = 0, slots_pfail = 0, slots_fail = 0;
+    uint64_t myepoch;
+    int j;
+    sds info = NULL;
+
+    for (j = 0; j < CLUSTER_SLOTS; j++) {
+        clusterNode *n = server.cluster->slots[j];
+
+        if (n == NULL) continue;
+        slots_assigned++;
+        if (nodeFailed(n)) {
+            slots_fail++;
+        } else if (nodeTimedOut(n)) {
+            slots_pfail++;
+        } else {
+            slots_ok++;
+        }
+
+        myepoch = (nodeIsSlave(myself) && myself->slaveof) ?
+                  myself->slaveof->configEpoch : myself->configEpoch;
+        
+        info = sdscatprintf(sdsempty(),
+            "cluster_state:%s\r\n"
+            "cluster_slots_assigned:%d\r\n"
+            "cluster_slots_ok:%d\r\n"
+            "cluster_slots_pfail:%d\r\n"
+            "cluster_slots_fail:%d\r\n"
+            "cluster_known_nodes:%lu\r\n"
+            "cluster_size:%d\r\n"
+            "cluster_current_epoch:%llu\r\n"
+            "cluster_my_epoch:%llu\r\n"
+            , statestr[server.cluster->state],
+            slots_assigned,
+            slots_ok,
+            slots_pfail,
+            slots_fail,
+            dictSize(server.cluster->nodes),
+            server.cluster->size,
+            (unsigned long long) server.cluster->currentEpoch,
+            (unsigned long long) myepoch
+        );
+
+        /* Show stats about messages sent and received. */
+        long long tot_msg_sent = 0;
+        long long tot_msg_received = 0;
+
+        for (int i = 0; i < CLUSTERMSG_TYPE_COUNT; i++) {
+            if (server.cluster->stats_bus_messages_sent[i] == 0) continue;
+            tot_msg_sent += server.cluster->stats_bus_messages_sent[i];
+            info = sdscatprintf(info,
+                "cluster_stats_messages_%s_sent:%lld\r\n",
+                clusterGetMessageTypeString(i),
+                server.cluster->stats_bus_messages_sent[i]);
+        }
+        info = sdscatprintf(info,
+            "cluster_stats_messages_sent:%lld\r\n", tot_msg_sent);
+    }
+    info = sdscatlen(info, "\r\n", 2);
+
+    return info;
 }
