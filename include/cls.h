@@ -51,6 +51,22 @@ extern "C" {
  */
 CLS_API void clsInit(int port, const char *cf);
 
+/** 
+ * Reset a node performing a soft or hard reset:
+ *
+ * 1) All other nodes are forget.
+ * 2) All the assigned / open slots are released.
+ * 3) If the node is a slave, it turns into a master.
+ * 5) Only for hard reset: a new Node ID is generated.
+ * 6) Only for hard reset: currentEpoch and configEpoch are set to 0.
+ * 7) The new configuration is saved and the cluster state updated.
+ * 8) If the node was a slave, the whole data set is flushed away. 
+ * 
+ * @param hard Only for hard reset: a new Node ID is generated. 
+ *             Only for hard reset: currentEpoch and configEpoch are set to 0.
+ */
+CLS_API void clsReset(int hard);
+
 /**
  * Start cluster service, This method always succeeds and returns 0.
  * This function is called after clsInit is called. This is the core function
